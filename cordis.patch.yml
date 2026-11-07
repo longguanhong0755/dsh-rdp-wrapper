@@ -1,0 +1,5 @@
+# dsh-rdp-wrapper bundle layer: applied when the package is installed as a
+# profile bundle (package.json declares dsh.bundle.patch).
+- insert:
+    - id: dsh-rdp-wrapper
+      name: 'dsh-rdp-wrapper'
