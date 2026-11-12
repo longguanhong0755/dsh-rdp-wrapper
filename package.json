@@ -1,7 +1,7 @@
 {
   "name": "dsh-rdp-wrapper",
-  "version": "0.4.3",
-  "description": "DeepSeek Harness (dsh) plugin: gives the agent a real interactive Windows desktop in an isolated RDP child session cloned from the console logon, with screenshot, mouse, keyboard, window, in-session exec and clipboard tools.",
+  "version": "0.5.0",
+  "description": "DeepSeek Harness (dsh) plugin: gives the agent a real interactive Windows desktop in an isolated RDP child session cloned from the console logon, with a UI Automation element index, annotated state snapshots, conditional waits, batch steps, screenshot, mouse, keyboard, window, in-session exec and clipboard tools.",
   "license": "MIT",
   "type": "module",
   "main": "./lib/index.js",

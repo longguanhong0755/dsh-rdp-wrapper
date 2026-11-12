@@ -11,6 +11,7 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
+using System.Windows.Automation;
 
 public static class W32
 {
@@ -73,6 +74,7 @@ public static class W32
     [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool IsHungAppWindow(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr hWnd, StringBuilder text, int maxCount);
     [DllImport("user32.dll")] public static extern int GetWindowTextLengthW(IntPtr hWnd);
@@ -587,6 +589,19 @@ public static class W32
         }
     }
 
+    // Clipboard-assisted paste: used for non-ASCII text (CJK input via
+    // VK_PACKET is unreliable when an IME is active). The previous clipboard
+    // text is restored when it was not empty.
+    public static void PasteText(string text)
+    {
+        string saved = "";
+        try { saved = GetClipboardText(); } catch { }
+        SetClipboardText(text);
+        KeyCombo(new ushort[] { 0x11, 0x56 });
+        Thread.Sleep(400);
+        try { if (saved != "") SetClipboardText(saved); } catch { }
+    }
+
     static void SendKeyInput(ushort vk, char uni, bool up)
     {
         INPUT[] inp = new INPUT[1];
@@ -727,6 +742,121 @@ public static class W32
         }
     }
 
+    // Full-screen capture with numbered boxes drawn on top of detected UI
+    // elements (set-of-marks style). boxes is a flat x,y,w,h array in screen
+    // coordinates; labels are the element indices shown to the model.
+    public static byte[] CaptureAnnotated(int x, int y, int w, int h, int[] boxes, string[] labels, bool marks)
+    {
+        if (w <= 0 || h <= 0) throw new Exception("invalid region size");
+        using (var bmp = new Bitmap(w, h))
+        {
+            using (var g = Graphics.FromImage(bmp))
+            {
+                g.CopyFromScreen(x, y, 0, 0, new Size(w, h), CopyPixelOperation.SourceCopy);
+                if (marks && boxes != null)
+                {
+                    using (var pen = new Pen(Color.FromArgb(255, 230, 60, 40), 1.4f))
+                    using (var font = new Font("Segoe UI", 12f, FontStyle.Bold, GraphicsUnit.Pixel))
+                    using (var bg = new SolidBrush(Color.FromArgb(215, 200, 30, 20)))
+                    using (var fg = new SolidBrush(Color.White))
+                    {
+                        int n = boxes.Length / 4;
+                        for (int i = 0; i < n; i++)
+                        {
+                            int bx = boxes[i * 4] - x;
+                            int by = boxes[i * 4 + 1] - y;
+                            int bw = boxes[i * 4 + 2];
+                            int bh = boxes[i * 4 + 3];
+                            if (bw <= 0 || bh <= 0) continue;
+                            if (bx + bw < 0 || by + bh < 0 || bx >= w || by >= h) continue;
+                            g.DrawRectangle(pen, bx, by, bw, bh);
+                            if (labels == null || i >= labels.Length) continue;
+                            string lb = labels[i];
+                            if (lb == null || lb.Length == 0) continue;
+                            SizeF sz = g.MeasureString(lb, font);
+                            float lw = sz.Width + 6, lh = sz.Height + 2;
+                            float lx = bx; if (lx + lw > w) lx = w - lw; if (lx < 0) lx = 0;
+                            float ly = by; if (ly + lh > h) ly = h - lh; if (ly < 0) ly = 0;
+                            g.FillRectangle(bg, lx, ly, lw, lh);
+                            g.DrawString(lb, font, fg, lx + 3, ly + 1);
+                        }
+                    }
+                }
+            }
+            return BmpToPng(bmp);
+        }
+    }
+
+    // Coarse screen signature used to detect "UI settled down" and "screen
+    // changed" without shipping pixels around. Sampling a grid is enough for
+    // dialogs, menus, page transitions and text appearing.
+    static long ScreenSignature(int x, int y, int w, int h)
+    {
+        if (w < 1) w = 1;
+        if (h < 1) h = 1;
+        using (var bmp = new Bitmap(w, h))
+        {
+            using (var g = Graphics.FromImage(bmp))
+            {
+                g.CopyFromScreen(x, y, 0, 0, new Size(w, h), CopyPixelOperation.SourceCopy);
+            }
+            const int cols = 48;
+            const int rows = 27;
+            unchecked
+            {
+                long hash = -3750763034362895579L;
+                for (int r = 0; r < rows; r++)
+                {
+                    int py = (int)((long)r * (h - 1) / (rows - 1));
+                    for (int c = 0; c < cols; c++)
+                    {
+                        int px = (int)((long)c * (w - 1) / (cols - 1));
+                        Color col = bmp.GetPixel(px, py);
+                        hash ^= (uint)(col.R | (col.G << 8) | (col.B << 16));
+                        hash *= 1099511628211L;
+                    }
+                }
+                return hash;
+            }
+        }
+    }
+
+    public static Dictionary<string, object> WaitScreen(string mode, int x, int y, int w, int h, int stableMs, int timeoutMs)
+    {
+        if (w <= 0 || h <= 0) throw new Exception("invalid wait region size");
+        if (stableMs < 100) stableMs = 100;
+        if (timeoutMs < 100) timeoutMs = 100;
+        int start = Environment.TickCount;
+        long baseSig = ScreenSignature(x, y, w, h);
+        long last = baseSig;
+        int lastChange = start;
+        bool ok = false;
+        string reason = "";
+        while (true)
+        {
+            int now = Environment.TickCount;
+            int elapsed = unchecked(now - start);
+            if (mode == "change")
+            {
+                if (last != baseSig) { ok = true; reason = "changed"; break; }
+            }
+            else
+            {
+                if (last != baseSig) { baseSig = last; lastChange = now; }
+                else if (unchecked(now - lastChange) >= stableMs) { ok = true; reason = "stable"; break; }
+            }
+            if (elapsed >= timeoutMs) { reason = "timeout"; break; }
+            Thread.Sleep(120);
+            last = ScreenSignature(x, y, w, h);
+        }
+        Dictionary<string, object> d = new Dictionary<string, object>();
+        d["ok"] = ok;
+        d["mode"] = mode;
+        d["waitedMs"] = unchecked(Environment.TickCount - start);
+        d["reason"] = reason;
+        return d;
+    }
+
     // ---- clipboard ----
     const uint CF_UNICODETEXT = 13;
     const uint GMEM_MOVEABLE = 0x0002;
@@ -771,5 +901,738 @@ public static class W32
             }
         }
         finally { CloseClipboard(); }
+    }
+}
+
+// =====================================================================
+// UI Automation layer: exposes the desktop as a compact, numbered list of
+// actionable elements so an agent can act by index instead of guessing
+// pixel coordinates from screenshots (Windows-MCP / Agent-S style).
+// Snapshots are cached in this process; rdp_state / uia list reset the
+// cache, uia find / uia wait append to it, so returned indices stay valid.
+// =====================================================================
+public static class Uia
+{
+    static readonly List<AutomationElement> _cache = new List<AutomationElement>();
+    static readonly List<string> _cacheDesc = new List<string>();
+    static readonly object _sync = new object();
+
+    class Snap
+    {
+        public List<AutomationElement> Els = new List<AutomationElement>();
+        public List<Dictionary<string, object>> Items = new List<Dictionary<string, object>>();
+        public int Total;
+        public bool Truncated;
+    }
+
+    static CacheRequest NewRequest()
+    {
+        CacheRequest req = new CacheRequest();
+        req.Add(AutomationElement.NameProperty);
+        req.Add(AutomationElement.AutomationIdProperty);
+        req.Add(AutomationElement.ClassNameProperty);
+        req.Add(AutomationElement.ControlTypeProperty);
+        req.Add(AutomationElement.BoundingRectangleProperty);
+        req.Add(AutomationElement.IsEnabledProperty);
+        req.Add(AutomationElement.IsOffscreenProperty);
+        req.Add(AutomationElement.HasKeyboardFocusProperty);
+        req.Add(AutomationElement.IsPasswordProperty);
+        req.Add(ValuePattern.ValueProperty);
+        req.Add(TogglePattern.ToggleStateProperty);
+        req.Add(SelectionItemPattern.IsSelectedProperty);
+        req.Add(ExpandCollapsePattern.ExpandCollapseStateProperty);
+        req.Add(InvokePattern.Pattern);
+        req.Add(ValuePattern.Pattern);
+        req.Add(TogglePattern.Pattern);
+        req.Add(SelectionItemPattern.Pattern);
+        req.Add(ExpandCollapsePattern.Pattern);
+        req.Add(ScrollItemPattern.Pattern);
+        req.TreeFilter = Automation.ControlViewCondition;
+        req.AutomationElementMode = AutomationElementMode.Full;
+        return req;
+    }
+
+    static object CP(AutomationElement el, AutomationProperty p, object dflt)
+    {
+        try { return el.GetCachedPropertyValue(p); }
+        catch { return dflt; }
+    }
+
+    static string StrProp(AutomationElement el, AutomationProperty p)
+    {
+        object v = CP(el, p, null);
+        if (v == null) return "";
+        return Convert.ToString(v).Trim();
+    }
+
+    static string TypeName(AutomationElement el)
+    {
+        object v = CP(el, AutomationElement.ControlTypeProperty, null);
+        ControlType ct = v as ControlType;
+        if (ct == null) return "";
+        string pn = ct.ProgrammaticName;
+        int dot = pn.LastIndexOf('.');
+        return dot >= 0 ? pn.Substring(dot + 1) : pn;
+    }
+
+    static string TypeNameLive(AutomationElement el)
+    {
+        try
+        {
+            string pn = el.Current.ControlType.ProgrammaticName;
+            int dot = pn.LastIndexOf('.');
+            return dot >= 0 ? pn.Substring(dot + 1) : pn;
+        }
+        catch { return ""; }
+    }
+
+    static System.Windows.Rect RectOf(AutomationElement el)
+    {
+        object v = CP(el, AutomationElement.BoundingRectangleProperty, null);
+        if (v is System.Windows.Rect) return (System.Windows.Rect)v;
+        return System.Windows.Rect.Empty;
+    }
+
+    static bool HasCachedPattern(AutomationElement el, AutomationPattern p)
+    {
+        try { object o; return el.TryGetCachedPattern(p, out o); }
+        catch { return false; }
+    }
+
+    static bool ActionableType(string t)
+    {
+        switch (t.ToLowerInvariant())
+        {
+            case "button": case "checkbox": case "radiobutton": case "combobox":
+            case "edit": case "document": case "hyperlink": case "listitem":
+            case "menuitem": case "tabitem": case "treeitem": case "slider":
+            case "spinner": case "splitbutton": case "dataitem": case "headeritem":
+            case "thumb":
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    // Scrollbar internals (arrow buttons, thumb) add noise to every list and
+    // are rarely what an agent wants to click; mouse wheel scrolling is the
+    // better primitive.
+    static bool InsideScrollBar(AutomationElement el)
+    {
+        try
+        {
+            AutomationElement p = TreeWalker.ControlViewWalker.GetParent(el);
+            for (int i = 0; i < 2 && p != null; i++)
+            {
+                if (p.Current.ControlType == ControlType.ScrollBar) return true;
+                p = TreeWalker.ControlViewWalker.GetParent(p);
+            }
+        }
+        catch { }
+        return false;
+    }
+
+    static Dictionary<string, object> Describe(AutomationElement el, int idx)
+    {
+        Dictionary<string, object> d = new Dictionary<string, object>();
+        d["i"] = idx;
+        string t = TypeName(el);
+        d["type"] = t;
+        bool pwd = (bool)CP(el, AutomationElement.IsPasswordProperty, false);
+        string name = StrProp(el, AutomationElement.NameProperty);
+        if (pwd) d["password"] = true;
+        if (name.Length > 0) d["name"] = name;
+        if (!pwd)
+        {
+            object vv = CP(el, ValuePattern.ValueProperty, null);
+            string val = vv == null ? "" : Convert.ToString(vv).Trim();
+            if (val.Length > 0 && val != name)
+            {
+                if (val.Length > 160) val = val.Substring(0, 160);
+                d["value"] = val;
+            }
+        }
+        System.Windows.Rect r = RectOf(el);
+        d["x"] = (int)Math.Round(r.Left);
+        d["y"] = (int)Math.Round(r.Top);
+        d["w"] = (int)Math.Round(r.Width);
+        d["h"] = (int)Math.Round(r.Height);
+        if (!(bool)CP(el, AutomationElement.IsEnabledProperty, true)) d["enabled"] = false;
+        if ((bool)CP(el, AutomationElement.HasKeyboardFocusProperty, false)) d["focused"] = true;
+        if (HasCachedPattern(el, SelectionItemPattern.Pattern))
+        {
+            object sel = CP(el, SelectionItemPattern.IsSelectedProperty, null);
+            if (sel is bool && (bool)sel) d["selected"] = true;
+        }
+        if (HasCachedPattern(el, TogglePattern.Pattern))
+        {
+            object tg = CP(el, TogglePattern.ToggleStateProperty, null);
+            if (tg is ToggleState)
+            {
+                ToggleState ts = (ToggleState)tg;
+                d["toggle"] = ts == ToggleState.On ? "on" : (ts == ToggleState.Off ? "off" : "mixed");
+            }
+        }
+        if (HasCachedPattern(el, ExpandCollapsePattern.Pattern))
+        {
+            object ex = CP(el, ExpandCollapsePattern.ExpandCollapseStateProperty, null);
+            if (ex is ExpandCollapseState)
+            {
+                ExpandCollapseState es = (ExpandCollapseState)ex;
+                if (es == ExpandCollapseState.Expanded) d["expanded"] = true;
+                else if (es == ExpandCollapseState.Collapsed) d["expanded"] = false;
+            }
+        }
+        if (!d.ContainsKey("name"))
+        {
+            string aid = StrProp(el, AutomationElement.AutomationIdProperty);
+            if (aid.Length > 0) d["id"] = aid;
+            else
+            {
+                string cls = StrProp(el, AutomationElement.ClassNameProperty);
+                if (cls.Length > 0) d["class"] = cls;
+            }
+        }
+        return d;
+    }
+
+    static string Desc(Dictionary<string, object> d)
+    {
+        string t = d.ContainsKey("type") ? Convert.ToString(d["type"]) : "?";
+        string n = d.ContainsKey("name") ? Convert.ToString(d["name"]) : "";
+        return n.Length > 0 ? t + " '" + n + "'" : t;
+    }
+
+    static AutomationElement RootFor(long handle)
+    {
+        if (handle != 0) return AutomationElement.FromHandle(new IntPtr(handle));
+        IntPtr fg = W32.GetForegroundWindow();
+        if (fg != IntPtr.Zero)
+        {
+            // Focus can sit on a child control (an Edit after typing). Always
+            // describe its top-level window, otherwise FindAll(Descendants)
+            // starts from a leaf and returns nothing.
+            IntPtr root = W32.GetAncestor(fg, 2); // GA_ROOT
+            if (root != IntPtr.Zero) fg = root;
+            try { return AutomationElement.FromHandle(fg); }
+            catch { }
+        }
+        return AutomationElement.RootElement;
+    }
+
+    static Snap Collect(AutomationElement root, bool interactiveOnly, int max, string role, string query)
+    {
+        AutomationElementCollection all;
+        CacheRequest req = NewRequest();
+        req.Push();
+        try { all = root.FindAll(TreeScope.Descendants, Automation.ControlViewCondition); }
+        finally { req.Pop(); }
+
+        List<AutomationElement> els = new List<AutomationElement>();
+        HashSet<string> seen = new HashSet<string>();
+        for (int i = 0; i < all.Count; i++)
+        {
+            AutomationElement el = all[i];
+            try
+            {
+                if ((bool)CP(el, AutomationElement.IsOffscreenProperty, false)) continue;
+                System.Windows.Rect r = RectOf(el);
+                if (r.Width < 1 || r.Height < 1) continue;
+                string t = TypeName(el);
+                if (t.Length == 0) continue;
+                bool actionable = ActionableType(t)
+                    || HasCachedPattern(el, InvokePattern.Pattern)
+                    || HasCachedPattern(el, TogglePattern.Pattern)
+                    || HasCachedPattern(el, SelectionItemPattern.Pattern)
+                    || HasCachedPattern(el, ExpandCollapsePattern.Pattern);
+                if (actionable && InsideScrollBar(el)) continue;
+                if (interactiveOnly && !actionable) continue;
+                if (!interactiveOnly && !actionable && (t == "Pane" || t == "Group")) continue;
+                if (!interactiveOnly && !actionable && t == "ScrollBar") continue;
+                if (!string.IsNullOrEmpty(role) && !string.Equals(t, role, StringComparison.OrdinalIgnoreCase)) continue;
+                string name = StrProp(el, AutomationElement.NameProperty);
+                string val = "";
+                object vv = CP(el, ValuePattern.ValueProperty, null);
+                if (vv != null) val = Convert.ToString(vv);
+                if (!string.IsNullOrEmpty(query))
+                {
+                    if (name.IndexOf(query, StringComparison.OrdinalIgnoreCase) < 0 &&
+                        val.IndexOf(query, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                }
+                if (!interactiveOnly && name.Length == 0 && val.Length == 0 && !actionable) continue;
+                string key = t + "|" + name + "|" + val + "|" + ((int)r.Left) + "," + ((int)r.Top) + "," + ((int)r.Width) + "x" + ((int)r.Height);
+                if (!seen.Add(key)) continue;
+                els.Add(el);
+            }
+            catch (ElementNotAvailableException) { }
+            catch (InvalidOperationException) { }
+        }
+
+        Snap s = new Snap();
+        s.Total = els.Count;
+        els.Sort(delegate(AutomationElement a, AutomationElement b)
+        {
+            System.Windows.Rect ra = RectOf(a);
+            System.Windows.Rect rb = RectOf(b);
+            int ya = (int)ra.Top, yb = (int)rb.Top;
+            if (Math.Abs(ya - yb) > 12) return ya.CompareTo(yb);
+            int xa = (int)ra.Left, xb = (int)rb.Left;
+            if (xa != xb) return xa.CompareTo(xb);
+            return ya.CompareTo(yb);
+        });
+        if (max > 0 && els.Count > max)
+        {
+            s.Truncated = true;
+            els.RemoveRange(max, els.Count - max);
+        }
+        s.Els = els;
+        for (int i = 0; i < els.Count; i++) s.Items.Add(Describe(els[i], i));
+        return s;
+    }
+
+    static AutomationElement Cached(int idx)
+    {
+        lock (_sync)
+        {
+            if (idx < 0 || idx >= _cache.Count)
+                throw new Exception("element index " + idx + " is not in the current snapshot; call rdp_state (or rdp_uia action=list) again");
+            return _cache[idx];
+        }
+    }
+
+    static string CachedDesc(int idx)
+    {
+        lock (_sync)
+        {
+            if (idx < 0 || idx >= _cacheDesc.Count) return "";
+            return _cacheDesc[idx];
+        }
+    }
+
+    static void VerifyAlive(AutomationElement el, string what)
+    {
+        try { System.Windows.Rect r = el.Current.BoundingRectangle; }
+        catch (Exception e)
+        {
+            throw new Exception(what + " is no longer available (the UI changed); call rdp_state again [" + e.GetType().Name + "]");
+        }
+    }
+
+    static bool IsAscii(string s)
+    {
+        foreach (char c in s)
+        {
+            if (c == '\t' || c == '\n' || c == '\r') continue;
+            if (c < 0x20 || c > 0x7E) return false;
+        }
+        return true;
+    }
+
+    static bool TryCurrent(AutomationElement el, AutomationPattern p, out object o)
+    {
+        o = null;
+        try { return el.TryGetCurrentPattern(p, out o); }
+        catch { return false; }
+    }
+
+    static void FocusWindowOf(AutomationElement el)
+    {
+        try
+        {
+            AutomationElement cur = el;
+            for (int i = 0; i < 12 && cur != null; i++)
+            {
+                int h = 0;
+                try { h = cur.Current.NativeWindowHandle; }
+                catch { }
+                if (h != 0)
+                {
+                    W32.FocusWindow(new IntPtr(h));
+                    Thread.Sleep(50);
+                    return;
+                }
+                AutomationElement par = TreeWalker.ControlViewWalker.GetParent(cur);
+                if (par == null || par == AutomationElement.RootElement) return;
+                cur = par;
+            }
+        }
+        catch { }
+    }
+
+    static void RealClick(AutomationElement el, bool dbl)
+    {
+        object p;
+        try { if (el.TryGetCurrentPattern(ScrollItemPattern.Pattern, out p)) ((ScrollItemPattern)p).ScrollIntoView(); }
+        catch { }
+        FocusWindowOf(el);
+        System.Windows.Rect r;
+        try { r = el.Current.BoundingRectangle; }
+        catch (Exception e) { throw new Exception("element disappeared before clicking: " + e.Message); }
+        int cx = (int)Math.Round(r.Left + r.Width / 2);
+        int cy = (int)Math.Round(r.Top + r.Height / 2);
+        W32.MouseMoveAbs(cx, cy);
+        Thread.Sleep(40);
+        W32.MouseClick("left", dbl);
+    }
+
+    static AutomationElement Resolve(int index, string text, string role, long handle, bool interactiveOnly, out int usedIndex)
+    {
+        usedIndex = -1;
+        if (index >= 0)
+        {
+            AutomationElement el = Cached(index);
+            string desc = CachedDesc(index);
+            VerifyAlive(el, "element " + index + (desc.Length > 0 ? " (" + desc + ")" : ""));
+            usedIndex = index;
+            return el;
+        }
+        if (string.IsNullOrEmpty(text))
+            throw new Exception("provide 'i' (element index from rdp_state) or 'text' to match by name");
+        Snap s = Collect(RootFor(handle), interactiveOnly, 4000, role, text);
+        if (s.Els.Count == 0)
+            throw new Exception("no element matched text '" + text + "' (call rdp_state to see the current elements)");
+        int best = 0;
+        for (int k = 0; k < s.Els.Count; k++)
+        {
+            if (string.Equals(StrProp(s.Els[k], AutomationElement.NameProperty), text, StringComparison.OrdinalIgnoreCase)) { best = k; break; }
+        }
+        AutomationElement found = s.Els[best];
+        lock (_sync)
+        {
+            usedIndex = _cache.Count;
+            _cache.Add(found);
+            _cacheDesc.Add(Desc(s.Items[best]));
+        }
+        return found;
+    }
+
+    // ---------------- public API (called from rdp-bridge.ps1) ----------------
+
+    public static Dictionary<string, object> List(long handle, bool interactiveOnly, int max, string role)
+    {
+        if (max <= 0) max = 200;
+        Snap s = Collect(RootFor(handle), interactiveOnly, max, role, null);
+        lock (_sync)
+        {
+            _cache.Clear();
+            _cacheDesc.Clear();
+            for (int i = 0; i < s.Els.Count; i++)
+            {
+                _cache.Add(s.Els[i]);
+                _cacheDesc.Add(Desc(s.Items[i]));
+            }
+        }
+        Dictionary<string, object> res = new Dictionary<string, object>();
+        res["elements"] = s.Items;
+        res["total"] = s.Total;
+        res["truncated"] = s.Truncated;
+        return res;
+    }
+
+    public static Dictionary<string, object> Find(long handle, string text, string role, bool interactiveOnly, int max)
+    {
+        if (string.IsNullOrEmpty(text)) throw new Exception("uia find requires 'text'");
+        if (max <= 0) max = 50;
+        Snap s = Collect(RootFor(handle), interactiveOnly, 4000, role, text);
+        List<Dictionary<string, object>> outItems = new List<Dictionary<string, object>>();
+        lock (_sync)
+        {
+            for (int i = 0; i < s.Els.Count && outItems.Count < max; i++)
+            {
+                int ni = _cache.Count;
+                _cache.Add(s.Els[i]);
+                Dictionary<string, object> d = s.Items[i];
+                d["i"] = ni;
+                _cacheDesc.Add(Desc(d));
+                outItems.Add(d);
+            }
+        }
+        Dictionary<string, object> res = new Dictionary<string, object>();
+        res["elements"] = outItems;
+        res["count"] = outItems.Count;
+        res["total"] = s.Total;
+        return res;
+    }
+
+    public static Dictionary<string, object> Get(int index)
+    {
+        AutomationElement el = Cached(index);
+        VerifyAlive(el, "element " + index);
+        Dictionary<string, object> d = new Dictionary<string, object>();
+        d["i"] = index;
+        d["type"] = TypeNameLive(el);
+        try
+        {
+            d["name"] = el.Current.Name;
+            bool pwd = el.Current.IsPassword;
+            if (pwd) d["password"] = true;
+            object vp;
+            if (!pwd && el.TryGetCurrentPattern(ValuePattern.Pattern, out vp))
+            {
+                string v = ((ValuePattern)vp).Current.Value;
+                if (v != null && v.Length > 0) d["value"] = v;
+            }
+            // Document controls (multiline TextBox, Word, browsers) expose no
+            // ValuePattern; TextPattern is how you read back typed content.
+            object txp;
+            if (!pwd && !d.ContainsKey("value") && el.TryGetCurrentPattern(TextPattern.Pattern, out txp))
+            {
+                try
+                {
+                    string txt = ((TextPattern)txp).DocumentRange.GetText(4000);
+                    if (!string.IsNullOrEmpty(txt)) d["text"] = txt;
+                }
+                catch { }
+            }
+            object tp;
+            if (el.TryGetCurrentPattern(TogglePattern.Pattern, out tp))
+                d["toggle"] = ((TogglePattern)tp).Current.ToggleState.ToString().ToLowerInvariant();
+            object ep;
+            if (el.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out ep))
+                d["expanded"] = ((ExpandCollapsePattern)ep).Current.ExpandCollapseState == ExpandCollapseState.Expanded;
+            object sp;
+            if (el.TryGetCurrentPattern(SelectionItemPattern.Pattern, out sp))
+                d["selected"] = ((SelectionItemPattern)sp).Current.IsSelected;
+            object selp;
+            if (el.TryGetCurrentPattern(SelectionPattern.Pattern, out selp))
+            {
+                try
+                {
+                    AutomationElement[] picked = ((SelectionPattern)selp).Current.GetSelection();
+                    if (picked != null && picked.Length > 0)
+                    {
+                        string[] names = new string[picked.Length];
+                        for (int si = 0; si < picked.Length; si++)
+                        {
+                            try { names[si] = picked[si].Current.Name; } catch { names[si] = ""; }
+                        }
+                        d["selection"] = string.Join(", ", names);
+                    }
+                }
+                catch { }
+            }
+            System.Windows.Rect r = el.Current.BoundingRectangle;
+            d["x"] = (int)Math.Round(r.Left);
+            d["y"] = (int)Math.Round(r.Top);
+            d["w"] = (int)Math.Round(r.Width);
+            d["h"] = (int)Math.Round(r.Height);
+            d["enabled"] = el.Current.IsEnabled;
+            d["focused"] = el.Current.HasKeyboardFocus;
+        }
+        catch (Exception e)
+        {
+            throw new Exception("could not read element " + index + ": " + e.Message);
+        }
+        return d;
+    }
+
+    public static Dictionary<string, object> Click(int index, string text, string role, long handle, bool doubleClick)
+    {
+        int usedIndex;
+        AutomationElement el = Resolve(index, text, role, handle, true, out usedIndex);
+        string t = TypeName(el);
+        string name = StrProp(el, AutomationElement.NameProperty);
+        bool enabled = true;
+        try { enabled = el.Current.IsEnabled; } catch { }
+        if (!enabled) throw new Exception("element is disabled: " + (name.Length > 0 ? t + " '" + name + "'" : t));
+
+        string via;
+        if (doubleClick)
+        {
+            RealClick(el, true);
+            via = "mouse";
+        }
+        else
+        {
+            object pat;
+            object ep;
+            bool collapsed = false;
+            if (el.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out ep))
+                collapsed = ((ExpandCollapsePattern)ep).Current.ExpandCollapseState == ExpandCollapseState.Collapsed;
+            if (t == "MenuItem" && collapsed && ep != null)
+            {
+                ((ExpandCollapsePattern)ep).Expand();
+                via = "expand";
+            }
+            else if (TryCurrent(el, InvokePattern.Pattern, out pat))
+            {
+                ((InvokePattern)pat).Invoke();
+                via = "invoke";
+            }
+            else if (TryCurrent(el, TogglePattern.Pattern, out pat))
+            {
+                ((TogglePattern)pat).Toggle();
+                via = "toggle";
+            }
+            else if (TryCurrent(el, SelectionItemPattern.Pattern, out pat))
+            {
+                ((SelectionItemPattern)pat).Select();
+                via = "select";
+            }
+            else if (TryCurrent(el, ExpandCollapsePattern.Pattern, out pat))
+            {
+                if (((ExpandCollapsePattern)pat).Current.ExpandCollapseState == ExpandCollapseState.Collapsed)
+                {
+                    ((ExpandCollapsePattern)pat).Expand();
+                    via = "expand";
+                }
+                else
+                {
+                    ((ExpandCollapsePattern)pat).Collapse();
+                    via = "collapse";
+                }
+            }
+            else
+            {
+                RealClick(el, false);
+                via = "mouse";
+            }
+        }
+        Thread.Sleep(120);
+        Dictionary<string, object> d = new Dictionary<string, object>();
+        d["clicked"] = true;
+        d["i"] = usedIndex;
+        d["type"] = t;
+        if (name.Length > 0) d["name"] = name;
+        d["via"] = via;
+        if (doubleClick) d["double"] = true;
+        return d;
+    }
+
+    public static Dictionary<string, object> SetValue(int index, string text, string role, long handle, string value, bool submit, bool clear)
+    {
+        int usedIndex;
+        AutomationElement el = Resolve(index, text, role, handle, true, out usedIndex);
+        string t = TypeName(el);
+        string name = StrProp(el, AutomationElement.NameProperty);
+        string via = "";
+        if (!clear)
+        {
+            object pat;
+            if (TryCurrent(el, ValuePattern.Pattern, out pat))
+            {
+                ValuePattern vp = (ValuePattern)pat;
+                try
+                {
+                    if (!vp.Current.IsReadOnly)
+                    {
+                        vp.SetValue(value);
+                        via = "value";
+                    }
+                }
+                catch { }
+            }
+        }
+        if (via.Length == 0)
+        {
+            FocusWindowOf(el);
+            try { el.SetFocus(); }
+            catch (Exception e) { throw new Exception("could not focus the element for typing: " + e.Message); }
+            Thread.Sleep(80);
+            if (clear)
+            {
+                W32.KeyCombo(new ushort[] { 0x11, 0x41 });
+                Thread.Sleep(60);
+            }
+            if (IsAscii(value))
+            {
+                W32.TypeText(value);
+                via = "keys";
+            }
+            else
+            {
+                W32.PasteText(value);
+                via = "paste";
+            }
+        }
+        if (submit)
+        {
+            try { FocusWindowOf(el); el.SetFocus(); } catch { }
+            Thread.Sleep(60);
+            W32.KeyTap(0x0D);
+            Thread.Sleep(120);
+        }
+        Dictionary<string, object> d = new Dictionary<string, object>();
+        d["set"] = true;
+        d["i"] = usedIndex;
+        d["type"] = t;
+        if (name.Length > 0) d["name"] = name;
+        d["via"] = via;
+        d["chars"] = value.Length;
+        if (submit) d["submitted"] = true;
+        return d;
+    }
+
+    public static Dictionary<string, object> Focus(int index, string text, string role, long handle)
+    {
+        int usedIndex;
+        AutomationElement el = Resolve(index, text, role, handle, true, out usedIndex);
+        string name = StrProp(el, AutomationElement.NameProperty);
+        FocusWindowOf(el);
+        el.SetFocus();
+        Thread.Sleep(60);
+        Dictionary<string, object> d = new Dictionary<string, object>();
+        d["focused"] = true;
+        d["i"] = usedIndex;
+        d["type"] = TypeName(el);
+        if (name.Length > 0) d["name"] = name;
+        return d;
+    }
+
+    public static Dictionary<string, object> WaitForElement(long handle, string text, string role, int timeoutMs, bool gone)
+    {
+        if (string.IsNullOrEmpty(text)) throw new Exception("wait element requires 'text'");
+        if (timeoutMs < 100) timeoutMs = 100;
+        int start = Environment.TickCount;
+        while (true)
+        {
+            AutomationElement match = null;
+            Snap s = null;
+            try
+            {
+                s = Collect(RootFor(handle), false, 4000, role, text);
+                if (s.Els.Count > 0) match = s.Els[0];
+            }
+            catch (Exception) { }
+            int elapsed = unchecked(Environment.TickCount - start);
+            if (gone)
+            {
+                if (match == null)
+                {
+                    Dictionary<string, object> g = new Dictionary<string, object>();
+                    g["found"] = true;
+                    g["gone"] = true;
+                    g["waitedMs"] = elapsed;
+                    return g;
+                }
+            }
+            else if (match != null)
+            {
+                int idx;
+                lock (_sync)
+                {
+                    idx = _cache.Count;
+                    _cache.Add(match);
+                    _cacheDesc.Add(Desc(s.Items[0]));
+                }
+                Dictionary<string, object> d = new Dictionary<string, object>();
+                d["found"] = true;
+                d["i"] = idx;
+                d["type"] = TypeName(match);
+                string name = StrProp(match, AutomationElement.NameProperty);
+                if (name.Length > 0) d["name"] = name;
+                d["waitedMs"] = elapsed;
+                return d;
+            }
+            if (elapsed >= timeoutMs)
+            {
+                Dictionary<string, object> d = new Dictionary<string, object>();
+                d["found"] = false;
+                d["gone"] = gone;
+                d["waitedMs"] = elapsed;
+                return d;
+            }
+            Thread.Sleep(300);
+        }
     }
 }

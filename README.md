@@ -18,6 +18,7 @@ dsh（DeepSeek Harness）本身没有"看屏幕、点鼠标"的能力。这个�
 | --- | --- |
 | agent 只能执行命令行命令 | agent 能**看到**桌面（截图） |
 | 打不开 GUI 程序、点不了按钮 | agent 能**操作** GUI：开程序、点按钮、填表单、拖文件 |
+| 靠猜坐标点界面，改一下就失效 | 按**元素索引**操作（UI Automation），窗口在后台也能点 |
 | 无法处理任何图形界面任务 | GUI 自动化任务（装软件、改设置、操作网页/桌面应用）都能交给 agent |
 
 **agent 看到的桌面和你看到的是同一个 Windows，但不是同一个"会话"**：插件用 BetterGI「桌面分身」同款机制（`MsRdpClient10` ActiveX + `ConnectToChildSession=true`）从你当前的登录克隆出一个 RDP child session。克隆会话共享你的账号与文件，但桌面、键鼠、剪贴板是独立的——**你手上的鼠标键盘不会被抢走，你的桌面也不会被切走**。
@@ -39,6 +40,19 @@ dsh（DeepSeek Harness）本身没有"看屏幕、点鼠标"的能力。这个�
 **🔍 区域截图** —— 也可以只截一个窗口或区域，方便 agent 精确定位：
 
 ![区域截图](assets/demo-region.png)
+
+**🧭 带编号的界面快照（0.5.0）** —— `rdp_state` 一次调用返回前台窗口、窗口列表、所有可操作元素的索引，以及一张画了红色编号框的截图。agent 直接"点 i5"，不用猜坐标：
+
+![元素编号](assets/demo-marks.png)
+
+**⚡ 更少、更难失效的调用（0.5.0）**
+
+- `rdp_uia click {i}` 优先走 UI Automation（Invoke / Toggle / Select），元素被遮挡、窗口在后台也能点中；失败才回退真实鼠标。
+- `rdp_uia setvalue` 直接写输入框（UIA ValuePattern / 粘贴），中文也一字不差，不必先点焦点。
+- `rdp_uia find {text}` 用元素名/文本定位，不依赖截图坐标。
+- `rdp_wait` 等元素出现/消失、窗口出现/消失、画面稳定/变化，替代 `sleep`。
+- `rdp_do` 把可预测的步骤（click → wait → type → Enter）打包成一次调用，只验结果。
+- `rdp_app {name}` 启动应用并直接返回它的窗口（支持 Paint、Notepad 等别名）。
 
 ---
 
@@ -64,7 +78,7 @@ dsh（DeepSeek Harness）本身没有"看屏幕、点鼠标"的能力。这个�
    ```
    > `link:` 指向本仓库目录。如果放在别的盘/路径，改成你的实际路径。
 
-2. **重启 dsh**。启动日志里应出现 `[dsh-rdp-wrapper] loaded: 12 tool(s) registered`。
+2. **重启 dsh**。启动日志里应出现 `[dsh-rdp-wrapper] loaded: 17 tool(s) registered`。
 
 ### 第 2 步：一次性初始化（provision）
 
@@ -81,14 +95,14 @@ provision 只做初始化：建目录、拷贝 bridge 到 `C:\ProgramData\dsh-rd
 重启后的 dsh 对话里，直接对 agent 说：
 
 ```
-用 rdp_doctor 体检，然后 rdp_connect 连接桌面，截图看看当前桌面。
+用 rdp_doctor 体检，然后 rdp_connect 连接桌面，用 rdp_state 看看当前桌面。
 ```
 
 成功的话你会看到 agent 返回一张 1920×1080 的桌面截图。第一次连接约 15–30s（建会话 + 编译 bridge），之后秒连。用完让 agent 跑 `rdp_disconnect` 清理干净。
 
 ---
 
-## 工具一览（12 个）
+## 工具一览（17 个）
 
 | 工具 | 干什么用 |
 | --- | --- |
@@ -98,14 +112,19 @@ provision 只做初始化：建目录、拷贝 bridge 到 `C:\ProgramData\dsh-rd
 | `rdp_status` | host 状态、会话列表、存活 bridge |
 | `rdp_disconnect` | 登出子会话、清理 host 与残留文件 |
 | `rdp_info` | 会话屏幕尺寸/用户/DPI |
-| `rdp_screenshot` | full / region / window 截图，PNG 落盘并在对话里内联展示 |
+| `rdp_state` | **一次拿到**前台窗口、窗口列表、可操作元素（带索引 `i`）+ 编号标注截图 |
+| `rdp_uia` | 按索引/文本操作 UI：list / find / get / click / setvalue / focus / wait |
+| `rdp_wait` | 条件等待：元素出现/消失、窗口出现/消失、画面稳定/变化 |
+| `rdp_do` | 批量执行：把多个工具步骤合成一次调用，只返回汇总与结果 |
+| `rdp_app` | 按名称/路径启动应用并等它的窗口出现（支持 Paint、Notepad 等别名） |
+| `rdp_screenshot` | full / region / window 截图，返回 `origin`（图像左上角在屏幕上的位置）；PNG 落盘/内联展示，`savePath` 可另存 |
 | `rdp_mouse` | move / click / dblclick / rightclick / middleclick / drag / scroll |
 | `rdp_key` | 打字（Unicode 文本，`\n` = 回车）与组合键（`win+r`、`ctrl+shift+esc`、`alt+F4`） |
 | `rdp_window` | 窗口 list / focus / minimize / maximize / restore / close / move / resize / rect / wait |
 | `rdp_exec` | 在会话内执行命令（有桌面和登录 profile，UTF-8 输出，GUI 程序可 `wait=false`） |
 | `rdp_clipboard` | 读写会话剪贴板文本 |
 
-标准节奏：**`rdp_doctor` → `rdp_connect` → 截图定位 → 操作 → 验证截图 → `rdp_disconnect`**。
+标准节奏：**`rdp_doctor` → `rdp_connect` → `rdp_state` → `rdp_uia`/`rdp_do` 操作 → `rdp_wait`/`rdp_state` 验证 → `rdp_disconnect`**。
 
 ---
 
@@ -119,6 +138,8 @@ provision 只做初始化：建目录、拷贝 bridge 到 `C:\ProgramData\dsh-rd
 为什么这么设计：实测发现 Win11 中文 IME 激活时，`SendInput` 的 VK_PACKET Unicode 按键会被 IME 改写成一串乱码（"桌桌桌桌"、圆点、豆腐块都出现过）。而粘贴路径完全不受 IME 影响，实测一字不差。返回的 `via` 字段（`keys` / `clipboard`）告诉你实际走了哪条路。
 
 > **给 agent 的提示**：打字前先用 `rdp_mouse click` 点一下目标输入框，确保键盘焦点在里面 —— 新开的窗口焦点可能停在标题栏/标签条上，直接打字会"没有反应"。
+>
+> 只是**填输入框**的话，优先用 `rdp_uia setvalue {i, value}`：它走 UIA ValuePattern 或粘贴，不依赖键盘焦点，中文也不会被输入法改写。
 
 ---
 
@@ -126,7 +147,7 @@ provision 只做初始化：建目录、拷贝 bridge 到 `C:\ProgramData\dsh-rd
 
 ```
 dsh（你的桌面，console 会话）
-│  lib/index.js            12 个工具 + 系统提示词
+│  lib/index.js            17 个工具 + 系统提示词
 │  lib/bridge.js           桥接客户端（TCP 127.0.0.1，一连接一请求）
 │        │ powershell.exe -File scripts\*.ps1
 │        ▼
@@ -143,7 +164,8 @@ dsh（你的桌面，console 会话）
 1. `rdp_connect` 以管理员启动 `rdp-child-host.exe`（UAC）。
 2. host 用 `MsRdpClient10` ActiveX 连 `localhost`，扩展属性 `ConnectToChildSession=true` —— Windows 基于当前登录用户克隆出一个 RDP child session，**无需密码**；你正在用的 console 桌面不受影响。
 3. host 用临时计划任务 + `RunEx(TASK_RUN_USE_SESSION_ID)` 在子会话里启动 bridge（PowerShell，运行时编译内嵌 C#），监听 127.0.0.1 随机端口，端口/令牌写入 `C:\ProgramData\dsh-rdp-wrapper\ports\bridge-session-<sid>.json`。
-4. dsh 侧工具通过 TCP 调 bridge，bridge 在会话内完成截图 / SendInput / 窗口管理 / exec / 剪贴板。
+4. dsh 侧工具通过 TCP 调 bridge，bridge 在会话内完成截图 / UI Automation / SendInput / 窗口管理 / exec / 剪贴板。
+5. `rdp_state` / `rdp_uia list` 扫描前台窗口的 UI Automation 树（Control View，过滤滚动条等噪声），给每个可操作元素编号并缓存；同一张截图把这些编号画成红框。后续 `rdp_uia click {i}` 直接用缓存的 `AutomationElement`（Invoke/Toggle/Select/ExpandCollapse），模式不支持时才按元素矩形发真实鼠标。
 
 ### 常见疑问
 
@@ -167,6 +189,9 @@ dsh（你的桌面，console 会话）
 4. **含非 ASCII 的打字走剪贴板辅助**：会短暂占用会话剪贴板，尽力恢复原内容（极端情况下恢复可能晚于目标应用读取）。
 5. **分辨率由 host 的 ActiveX 窗口决定**，默认取 config（1920×1080）；`rdp_connect` 的 width/height 可覆盖。
 6. 会话只在 host 存活期间存在；残留会话由下次 connect/disconnect 清理。
+7. **元素索引依赖应用暴露 UI Automation 树**：WinForms/WPF/Office/资源管理器/传统 Win32 控件效果最好；Chromium/Electron 和自绘界面（例如新版画图的工具区）元素少，需回退 `rdp_screenshot` + `rdp_mouse`。索引只在最近一次 `rdp_state` / `rdp_uia list` / `find` / `wait` 之后有效，元素过期会明确提示重新取 state。
+8. **子会话与 console 共用 profile**：agent 启动应用时，应用可能恢复你上次的文档或浏览器标签页。提示词要求用 `process` 过滤只操作自己启动的窗口，但多标签应用仍可能带出旧内容——涉密文档不要留在最近打开列表里。
+9. **dsh 自身的沙箱可能阻止 agent 写宿主工作区**（`grantWrite(...)` 报错），与本插件无关；需要 agent 在宿主侧落文件时，把该会话权限调高（或让 agent 用 `rdp_exec` 在会话内完成）。
 
 ## 故障排查
 
@@ -182,24 +207,36 @@ dsh（你的桌面，console 会话）
 | 打字没反应 | 先点击目标输入框（焦点问题）；看返回的 `via`：中文走 `clipboard` 属正常 |
 | 右键菜单在截图里看不到 | 看 `popup.found`；默认已等待渲染；XAML 菜单可能需要 2–5s |
 
-## 验证状态（2026-11-07 本机实测）
+## 验证状态（2026-11-11 本机实测，0.5.0）
 
 | 项 | 状态 |
 | --- | --- |
-| 无密码创建 child session（ConnectToChildSession） | ✅ session 16–34 |
+| 无密码创建 child session（ConnectToChildSession） | ✅ session 16–49 |
 | 计划任务 + RunEx 启动 bridge | ✅（首次可能慢，重试机制兜底；超时就等 1–2 分钟重连） |
-| `info` / `screenshot` / `window` / `exec` / `clipboard` | ✅ |
 | 鼠标：真实 `SendInput` 点击、拖拽（画图折线）、桌面右键 | ✅ |
 | 键盘：`win+r`、`enter`、`esc`、`alt+F4` | ✅ |
 | 中英混合打字（中文 IME 激活时） | ✅ 0.4.3 修复 VK_PACKET 被 IME 改写的乱码 |
 | 右键菜单自动等待（XAML / 经典 `#32768`） | ✅ XAML 约 2–6s，经典菜单 <200ms |
-| 12 个工具经真实 `execute()` 全链路 connect → 操作 → disconnect | ✅ |
+| UIA 元素索引、按索引 click/setvalue/get、编号标注截图、条件等待、批量、应用启动 | ✅ **54/54 自动化回归全绿**（`test/e2e-tools.mjs`） |
+| 17 个工具经真实 `execute()` 全链路 connect → 操作 → disconnect | ✅ |
 | 退出清理（host / child session / 计划任务 / 端口文件） | ✅ |
+
+**真实 dsh agent 端到端**（同一个 Windows 本地工作区，agent 自己选工具、自己验证）：
+
+| 任务 | 工具步数 | 耗时 | token |
+| --- | --- | --- | --- |
+| 启动测试应用 → 填名 → 点按钮 → 读结果 → 退出 | 15 步 | 2m31s | 372K |
+| 同任务改为 `rdp_do` 批量（click → wait → type） | 11 步 | 1m39s | 264K |
+| 中文两行写入多行输入框 → 保存文件 → 逐字节核对 → 退出 | 15 步 | 1m53s | 359K |
+| 画图：选红色/18px 画笔 → 拖 3 笔画出 Z → 截图+像素校验 → 关闭不保存 | 21 步 | 2m32s | 766K |
+| 最终验收：connect → app → state → setvalue → click → window 截图（`savePath`）→ Quit → disconnect，核对 `savedTo` 与 `origin` | 13 步 | 1m04s | 307K |
+
+第 4 个任务里 agent 用会话内 Pillow/numpy 做了像素级校验（35,848 个红色像素、主色 RGB 237,28,36），所以 token 偏高；绘制本身不到 2 秒。这 4 轮真实使用还暴露并修掉了 5 个缺陷：`rdp_do` 返回值含 `undefined` 导致 dsh 报 lossless JSON 错误、`rdp_app` 的 `.exe` 进程过滤永不匹配、`rdp_window list` 忽略过滤条件、`rdp_wait` 用 handle 等窗口消失必超时、`rdp_screenshot` 的 `savePath` 被静默忽略。
 
 ## 目录
 
 ```
-lib/index.js                  dsh 插件入口（inject tools，注册 12 工具 + 系统提示词）
+lib/index.js                  dsh 插件入口（inject tools，注册 17 工具 + 系统提示词）
 lib/tools.js                  工具定义与参数
 lib/bridge.js                 bridge 发现 + TCP 客户端
 lib/trace.js                  加载期诊断日志（DSH_RDP_TRACE=1 才写）
@@ -215,13 +252,16 @@ scripts/childhost/build-childhost.ps1 用 .NET Framework csc 编译出 exe
 scripts/childhost/start-childhost.ps1 提权启动 host
 scripts/childhost/child-bridge-launcher.ps1 会话内校验 + 启动 bridge
 scripts/childhost/rdp-child-host.exe  已编译的宿主（源码改动后需重新 build）
-scripts/bridge/rdp-bridge.cs  桥接原生层（C# 5，运行时 Add-Type）
-scripts/bridge/rdp-bridge.ps1 桥接逻辑层（PS 5.1）
+scripts/bridge/rdp-bridge.cs  桥接原生层（C# 5，运行时 Add-Type：截图/UIA/SendInput/窗口）
+scripts/bridge/rdp-bridge.ps1 桥接逻辑层（PS 5.1：命令分发、元素缓存、等待、批量）
 cordis.patch.yml              dsh bundle patch
 test/ps-check.ps1             PS 语法检查（开发用）
 test/input-probe.ps1          鼠标注入自检（自建窗口，验证 SendInput/mouse_event）
 test/rdp-rpc.mjs              直接调用 bridge 的开发客户端
 test/drive-tools.mjs          不经 harness 直接驱动工具 execute()（开发自测）
+test/e2e-tools.mjs            0.5.0 全量回归（54 项，真实 child session）
+test/ui/RdpTestUi.cs          受控测试应用（WinForms：输入框/复选框/下拉框/对话框/保存）
+test/ui/RdpTestUi.exe         已编译的测试应用
 test/window-probe.ps1         窗口树 / 前台窗口诊断
 test/popup-growth.ps1         XAML 菜单出现时间与尺寸测量
 ```
@@ -229,6 +269,8 @@ test/popup-growth.ps1         XAML 菜单出现时间与尺寸测量
 ## 给维护者
 
 - 改 `lib/*.js` → 重启 dsh 才加载。
-- 改 `scripts/bridge/*.ps1|.cs` → 重跑 provision，并断开重连（bridge 在会话启动时加载）。
+- 改 `scripts/bridge/*.ps1|.cs` → 重跑 provision，并断开重连（bridge 在会话启动时加载）：
+  `powershell -File scripts/rdp-elevate.ps1 -Action provision -AgentUser <user> -BridgeSource <repo>\scripts\bridge` → `rdp_disconnect` → `rdp_connect`。
 - 改 `ChildHost.cs` → `scripts\childhost\build-childhost.ps1` 重编译。
 - 开发自测：`node test/drive-tools.mjs <tool> '<json>'`；经 `execute()` 传参用工具层参数名（screenshot region 用 `width/height`，drag 用 `x/y/x2/y2`）。
+- 回归：`node test/e2e-tools.mjs`（需要 bridge 已部署并 `rdp_connect`；会启动 `test/ui/RdpTestUi.exe`，结束时清理）。
